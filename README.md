@@ -255,12 +255,12 @@ curl http://localhost:8000/metrics
 
 ---
 
-## Pricing (for your clients)
+## Pricing
 
 | Tier | Price | Validations/mo |
 |------|-------|----------------|
-| Starter | $49/mo + $0.004/validation | 50K |
-| Growth | $299/mo + $0.002/validation | 500K |
+| Starter | --- | --- |
+| Growth | --- | --- |
 | Enterprise | Custom | Unlimited |
 
 ---
