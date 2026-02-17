@@ -9,7 +9,7 @@ Real-time task validation, worker scoring, earnings tracking, and community — 
 
 ```bash
 # 1. Clone + configure
-git clone https://github.com/yourco/ghostless-api
+git clone https://github.com/ajaykumar77-28/Ghostless-API.git
 cd ghostless-api
 cp .env.example .env
 # Edit .env — change SECRET_KEY at minimum
