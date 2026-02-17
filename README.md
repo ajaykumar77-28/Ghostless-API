@@ -5,7 +5,7 @@ Real-time task validation, worker scoring, earnings tracking, and community — 
 
 ---
 
-## Quickstart (3 minutes)
+## Quickstart
 
 ```bash
 # 1. Clone + configure
