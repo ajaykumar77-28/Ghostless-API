@@ -1,0 +1,293 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ghostless API — docker-compose.yml
+#
+# Profiles:
+#   (none / default)  → dev: hot-reload, no resource limits, exposed DB
+#   prod              → production overrides via docker-compose.prod.yml
+#   monitoring        → add Prometheus + Grafana
+#
+# Quick start:
+#   cp .env.development .env && docker compose up -d
+#
+# Production:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-common-env: &common-env
+  DATABASE_URL:          ${DATABASE_URL:-postgresql+asyncpg://ghost:${POSTGRES_PASSWORD:-ghost}@db:5432/ghostless}
+  DATABASE_SYNC_URL:     ${DATABASE_SYNC_URL:-postgresql://ghost:${POSTGRES_PASSWORD:-ghost}@db:5432/ghostless}
+  REDIS_URL:             ${REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+  CELERY_BROKER_URL:     ${CELERY_BROKER_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+  CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://:${REDIS_PASSWORD:-}@redis:6379/1}
+  SECRET_KEY:            ${SECRET_KEY:?SECRET_KEY must be set}
+  ENVIRONMENT:           ${ENVIRONMENT:-development}
+  DEBUG:                 ${DEBUG:-false}
+  APP_VERSION:           ${APP_VERSION:-6.0.0}
+
+x-api-base: &api-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      APP_VERSION: ${APP_VERSION:-6.0.0}
+      GIT_SHA:     ${GIT_SHA:-unknown}
+      BUILD_DATE:  ${BUILD_DATE:-unknown}
+  image: ghostless:${APP_VERSION:-6.0.0}
+  environment: *common-env
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  networks:
+    - ghostless
+
+services:
+  # ── API (FastAPI / uvicorn) ───────────────────────────────────────────────
+  api:
+    <<: *api-base
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./app:/app/app:ro             # dev hot-reload (remove in prod)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout:  10s
+      start_period: 30s
+      retries:  3
+    labels:
+      - "ghostless.service=api"
+      - "ghostless.version=${APP_VERSION:-6.0.0}"
+
+  # ── Celery Worker — general queue ─────────────────────────────────────────
+  worker:
+    <<: *api-base
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      -Q default,scoring
+      --hostname=worker@%h
+      --max-tasks-per-child=1000
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.celery_app", "inspect", "ping", "-d", "worker@%h"]
+      interval: 30s
+      timeout:  15s
+      start_period: 20s
+      retries:  3
+    depends_on:
+      - api   # ensures DB is migrated before worker starts
+    labels:
+      - "ghostless.service=worker"
+
+  # ── Celery Worker — webhooks (isolated queue, separate concurrency) ────────
+  webhook-worker:
+    <<: *api-base
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=info
+      --concurrency=8
+      -Q webhooks
+      --hostname=webhook@%h
+      --max-tasks-per-child=500
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.celery_app", "inspect", "ping", "-d", "webhook@%h"]
+      interval: 30s
+      timeout:  15s
+      start_period: 20s
+      retries:  3
+    labels:
+      - "ghostless.service=webhook-worker"
+
+  # ── Celery Beat (periodic tasks) ──────────────────────────────────────────
+  scheduler:
+    <<: *api-base
+    command: >
+      celery -A app.celery_app beat
+      --loglevel=info
+      --scheduler=celery.beat.PersistentScheduler
+      --schedule=/tmp/celerybeat-schedule
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/celerybeat-schedule"]
+      interval: 60s
+      timeout:  10s
+      start_period: 15s
+      retries:  3
+    labels:
+      - "ghostless.service=scheduler"
+
+  # ── PostgreSQL 16 ─────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     ghost
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ghost}
+      POSTGRES_DB:       ghostless
+      # Performance tuning
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./infra/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"   # hidden in prod override
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ghost -d ghostless"]
+      interval: 10s
+      timeout:  5s
+      retries:  10
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - ghostless
+    shm_size: "256mb"   # needed for parallel queries
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=512MB
+      -c maintenance_work_mem=128MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=4MB
+
+  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass "${REDIS_PASSWORD:-}"
+      --maxmemory ${REDIS_MAX_MEMORY:-512mb}
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+      --save 60 1000
+      --save 300 100
+      --save 900 1
+      --tcp-keepalive 60
+      --loglevel notice
+    volumes:
+      - redisdata:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"   # hidden in prod override
+    healthcheck:
+      test: ["CMD", "redis-cli", ${REDIS_PASSWORD:+"-a", "${REDIS_PASSWORD}"}, "ping"]
+      interval: 10s
+      timeout:  5s
+      retries:  10
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - ghostless
+
+  # ── Nginx (reverse proxy, rate limiting, TLS termination) ────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./infra/certs:/etc/nginx/certs:ro
+      - nginx-cache:/var/cache/nginx
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - ghostless
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+
+  # ── One-shot: run DB migrations ───────────────────────────────────────────
+  migrate:
+    <<: *api-base
+    command: alembic upgrade head
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    labels:
+      - "ghostless.service=migrate"
+
+  # ── Flower (Celery monitoring UI) ─────────────────────────────────────────
+  flower:
+    <<: *api-base
+    command: >
+      celery -A app.celery_app flower
+      --port=5555
+      --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-flower}
+      --url_prefix=flower
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    depends_on:
+      - redis
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    labels:
+      - "ghostless.service=flower"
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - ghostless
+    profiles:
+      - monitoring
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.0
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      GF_SERVER_ROOT_URL:         "%(protocol)s://%(domain)s/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - ghostless
+    profiles:
+      - monitoring
+
+networks:
+  ghostless:
+    driver: bridge
+
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local
+  nginx-cache:
+    driver: local
+  prometheusdata:
+    driver: local
+  grafanadata:
+    driver: local

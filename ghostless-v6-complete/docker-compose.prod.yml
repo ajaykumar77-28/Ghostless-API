@@ -1,0 +1,105 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ghostless API — Production Overrides
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# What this does differently from base:
+#   - Removes hot-reload volume mounts
+#   - Sets CPU/memory resource limits per service
+#   - Hides DB and Redis ports (internal only)
+#   - Scales API to 2 replicas (use with a load balancer)
+#   - Uses production logging drivers
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  api:
+    volumes: []          # no hot-reload in prod
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "ghostless.service"
+
+  worker:
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  webhook-worker:
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  scheduler:
+    deploy:
+      replicas: 1    # ALWAYS exactly 1 — duplicate beats cause chaos
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+
+  db:
+    ports: []          # no external port in prod — access via internal network only
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 2G
+        reservations:
+          cpus: "1.0"
+          memory: 1G
+
+  redis:
+    ports: []          # no external port in prod
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  nginx:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
